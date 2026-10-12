@@ -1,0 +1,50 @@
+# Headless downloader image.
+#
+# Build context: the repository root (see docker-compose.yml which sets
+# `context: ..`). Running this image invokes `python main.py --bot`,
+# which runs the Telegram bot configured by the YTDLP_BOT_* environment
+# variables documented in interfaces/bot.py (it refuses to start without
+# YTDLP_BOT_TOKEN and YTDLP_BOT_ALLOWED_CHATS).
+FROM python:3.12-slim
+
+# Runtime deps: yt-dlp + bgutil plugin. Node.js is not needed in the
+# downloader image itself — PO Token minting happens in the bgutil
+# sidecar container. We install `ffmpeg` so yt-dlp can merge formats.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# deno: runs yt-dlp's JS challenge solver. Without a JS runtime yt-dlp
+# warns "JS runtimes: none" and some YouTube formats go missing. Pinned
+# for reproducible images (verified with yt-dlp 2026.08.19); bump
+# deliberately when yt-dlp needs a newer runtime.
+COPY --from=denoland/deno:bin-2.9.7 /deno /usr/local/bin/deno
+
+WORKDIR /app
+
+# Install Python deps first so the layer is cached across source changes.
+# [default] adds yt-dlp-ejs (the challenge solver scripts deno runs,
+# pinned to match yt-dlp) so they are not fetched from GitHub at run
+# time via --remote-components ejs:github.
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir \
+        "yt-dlp[default]>=2025.11.12" \
+        "bgutil-ytdlp-pot-provider"
+
+# Copy the project. `.dockerignore` at the repo root excludes the
+# Windows build caches, ffmpeg binaries, cookie files and `docker/data`.
+COPY . /app
+
+# Sensible defaults; individual vars are overridable from compose.
+ENV YTDLP_AUTH_METHOD=bgutil \
+    YTDLP_GETPOT_BGUTIL_BASEURL=http://bgutil:4416 \
+    YTDLP_OUTPUT_DIR=/data/downloads \
+    PYTHONUNBUFFERED=1
+
+# Ensure the output dir exists at image-build time so the first run
+# does not race the volume mount.
+RUN mkdir -p /data/downloads
+
+ENTRYPOINT ["python", "main.py", "--bot"]

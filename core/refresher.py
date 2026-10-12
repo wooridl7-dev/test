@@ -1,0 +1,342 @@
+"""Playwright-based YouTube cookie refresh logic (reusable module).
+
+This module owns the pure, reusable logic that used to live inside
+``scripts/refresh_cookies.py``. By extracting it we can drive the same
+flow from three callers without code duplication:
+
+* ``scripts/refresh_cookies.py`` — developer-facing CLI (unchanged UX).
+* :mod:`interfaces.gui` — "쿠키 자동 갱신" button.
+* :mod:`interfaces.cli` — interactive cookie menu option.
+
+Public API:
+    RefreshResult                 (dataclass)
+    refresh_cookies(...)          synchronous wrapper (uses asyncio.run)
+    playwright_available()        bool
+
+Exit-code semantics (mirrored on :attr:`RefreshResult.exit_code`):
+    0  success
+    1  playwright module not installed
+    2  browser launch failure / unexpected error
+    3  YouTube page load failure
+    4  login required (headless/auto mode only)
+    5  writing cookies file failed
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import os
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Optional
+
+__all__ = [
+    "RefreshResult",
+    "refresh_cookies",
+    "playwright_available",
+]
+
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RefreshResult:
+    """Outcome of :func:`refresh_cookies`.
+
+    Attributes:
+        success: True iff cookies were written and exit_code == 0.
+        exit_code: Same scheme as the legacy scripts/refresh_cookies.py
+            (0 success, 1 playwright missing, 2 browser launch, 3 page
+            load, 4 login required, 5 write fail).
+        message: Human-readable summary (may include Korean UI text).
+        cookies_written: Number of YouTube/Google cookies persisted.
+        output_path: Resolved path of the cookies.txt target.
+    """
+
+    success: bool
+    exit_code: int
+    message: str
+    cookies_written: int
+    output_path: Path
+
+
+# ---------------------------------------------------------------------------
+# Availability probe (importlib-only so it works without importing playwright)
+# ---------------------------------------------------------------------------
+
+
+def playwright_available() -> bool:
+    """Return True iff the ``playwright`` Python package is importable.
+
+    Deliberately uses :func:`importlib.util.find_spec` rather than an
+    ``import`` statement so the probe does not trigger Playwright's
+    browser binary lookup at inspection time.
+    """
+    try:
+        return importlib.util.find_spec("playwright") is not None
+    except (ValueError, ImportError):  # pragma: no cover - defensive
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Frozen-mode environment setup
+# ---------------------------------------------------------------------------
+
+
+def _configure_playwright_env() -> None:
+    """Point Playwright at bundled Chromium when running inside PyInstaller.
+
+    In dev mode this is a no-op so the developer's ``playwright install``
+    cache keeps working. In frozen mode we expect Chromium (and any
+    shell variants) to live under ``<_MEIPASS>/playwright-browsers/``,
+    which is exactly where the spec files drop the files harvested from
+    ``build/.playwright-cache`` at build time.
+
+    Must be called BEFORE the first ``from playwright ...`` import.
+    """
+    if not getattr(sys, "frozen", False):
+        return  # dev mode: use Playwright's default cache
+    meipass = getattr(sys, "_MEIPASS", None) or str(Path(sys.executable).parent)
+    bundled = Path(meipass) / "playwright-browsers"
+    if bundled.is_dir():
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled)
+
+
+# ---------------------------------------------------------------------------
+# Netscape cookie serialisation (private, verbatim from scripts/refresh_cookies)
+# ---------------------------------------------------------------------------
+
+
+def _cookie_to_netscape(c: dict) -> str:
+    """Playwright cookie dict -> single tab-separated Netscape line."""
+    domain: str = c["domain"]
+    include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+    path: str = c.get("path", "/")
+    secure = "TRUE" if c.get("secure") else "FALSE"
+    expires = int(c.get("expires", -1))
+    if expires <= 0:
+        expires = 0  # yt-dlp treats 0 as a session cookie
+    name: str = c["name"]
+    value: str = c["value"]
+    return f"{domain}\t{include_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}"
+
+
+def _build_netscape_content(cookies: list[dict]) -> bytes:
+    """Serialise cookies into a full Netscape file body (LF, no BOM)."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        "# Netscape HTTP Cookie File",
+        f"# Generated by core.refresher at {ts}",
+        "# Do not edit. Regenerate via GUI 쿠키 자동 갱신 or scripts/refresh_cookies.py",
+        "",
+    ]
+    for c in cookies:
+        lines.append(_cookie_to_netscape(c))
+    content = "\n".join(lines) + "\n"
+    return content.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Async driver
+# ---------------------------------------------------------------------------
+
+
+async def _run(
+    output_path: Path,
+    profile_dir: Path,
+    browser: str,
+    auto: bool,
+    log: Callable[[str], None],
+) -> tuple[int, str, int]:
+    """Execute the Playwright flow.
+
+    Returns (exit_code, message, cookies_written).
+    """
+    # playwright import must happen AFTER _configure_playwright_env() has
+    # had a chance to set PLAYWRIGHT_BROWSERS_PATH. The public wrapper
+    # handles that; here we just do the import lazily so an ImportError
+    # is surfaced as a structured RefreshResult rather than an uncaught
+    # traceback.
+    try:
+        from playwright.async_api import async_playwright, Error as PlaywrightError
+    except ImportError:
+        msg = (
+            "Playwright 모듈이 설치되어 있지 않습니다.\n"
+            "개발 환경에서는 다음 명령으로 설치하세요:\n"
+            "    pip install -r scripts/requirements.txt\n"
+            f"    python -m playwright install {browser}"
+        )
+        log(msg)
+        return 1, msg, 0
+
+    headless = auto
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    context = None
+    try:
+        async with async_playwright() as p:
+            browser_type = getattr(p, browser)
+            try:
+                context = await browser_type.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=headless,
+                )
+            except PlaywrightError as exc:
+                msg = f"브라우저 실행 실패 — {exc}"
+                log(msg)
+                return 2, msg, 0
+
+            # Reuse the first existing page if any, else open a new one.
+            pages = context.pages
+            page = pages[0] if pages else await context.new_page()
+
+            # Visit YouTube with one retry.
+            for attempt in range(2):
+                try:
+                    await page.goto(
+                        "https://www.youtube.com",
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    break
+                except PlaywrightError as exc:
+                    if attempt == 0:
+                        log(f"페이지 로드 실패, 10초 후 재시도 — {exc}")
+                        await asyncio.sleep(10)
+                    else:
+                        msg = f"YouTube 페이지 로드 실패 — {exc}"
+                        log(msg)
+                        await context.close()
+                        return 3, msg, 0
+
+            # Auto mode: detect Google sign-in page and bail out instead
+            # of waiting forever for a human.
+            if auto:
+                current_url: str = page.url
+                title: str = await page.title()
+                login_in_url = "accounts.google.com" in current_url
+                import re
+                login_in_title = bool(re.search(r"Sign in|로그인", title, re.IGNORECASE))
+                if login_in_url or login_in_title:
+                    msg = (
+                        "로그인 필요: 헤드리스 모드에서 Google 로그인 페이지가 감지되었습니다. "
+                        "headful 모드로 다시 실행하여 수동 로그인하세요."
+                    )
+                    log(msg)
+                    await context.close()
+                    return 4, msg, 0
+            else:
+                # Headful: wait until the network settles so cookie
+                # round-trips finish. Timeout is non-fatal.
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=30_000)
+                except PlaywrightError:
+                    pass
+
+            # Collect cookies scoped to .youtube.com / .google.com.
+            all_cookies: list[dict] = await context.cookies()
+            cookies = [
+                c for c in all_cookies
+                if "youtube.com" in c.get("domain", "")
+                or "google.com" in c.get("domain", "")
+            ]
+
+            content = _build_netscape_content(cookies)
+
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, mode="wb") as f:
+                    f.write(content)
+            except OSError as exc:
+                msg = f"파일 쓰기 실패 — {output_path}: {exc}"
+                log(msg)
+                await context.close()
+                return 5, msg, len(cookies)
+
+            ok_msg = f"✓ Saved {len(cookies)} cookies to {output_path}"
+            log(ok_msg)
+            await context.close()
+            return 0, ok_msg, len(cookies)
+
+    except Exception as exc:  # pylint: disable=broad-except
+        msg = f"예상치 못한 오류 — {exc}"
+        log(msg)
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        return 2, msg, 0
+
+
+# ---------------------------------------------------------------------------
+# Public synchronous wrapper
+# ---------------------------------------------------------------------------
+
+
+def refresh_cookies(
+    output: Path,
+    profile_dir: Path,
+    browser: str = "chromium",
+    auto: bool = False,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> RefreshResult:
+    """Run the Playwright cookie-refresh flow and return a structured result.
+
+    Args:
+        output: Destination path for the Netscape cookies.txt.
+        profile_dir: Persistent browser profile directory. First run will
+            open a browser window for manual login; subsequent runs
+            reuse this profile and can run headless.
+        browser: ``"chromium"`` (default) or ``"firefox"``.
+        auto: If True, run headless and abort (exit 4) when YouTube
+            redirects to the Google sign-in page.
+        log_callback: Optional sink for human-readable progress lines.
+            When None, all messages are discarded silently (callers that
+            want stderr should wrap with ``lambda m: print(m, file=sys.stderr)``).
+
+    Returns:
+        :class:`RefreshResult`.
+    """
+    # Set bundled browser path BEFORE any playwright import.
+    _configure_playwright_env()
+
+    log: Callable[[str], None] = log_callback if log_callback is not None else (lambda _msg: None)
+
+    output_path = Path(output).expanduser().resolve()
+    profile_path = Path(profile_dir).expanduser().resolve()
+
+    try:
+        exit_code, message, cookies_written = asyncio.run(
+            _run(output_path, profile_path, browser, auto, log)
+        )
+    except KeyboardInterrupt:
+        return RefreshResult(
+            success=False,
+            exit_code=1,
+            message="사용자에 의해 중단되었습니다.",
+            cookies_written=0,
+            output_path=output_path,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        return RefreshResult(
+            success=False,
+            exit_code=2,
+            message=f"치명적 오류: {exc}",
+            cookies_written=0,
+            output_path=output_path,
+        )
+
+    return RefreshResult(
+        success=(exit_code == 0),
+        exit_code=exit_code,
+        message=message,
+        cookies_written=cookies_written,
+        output_path=output_path,
+    )

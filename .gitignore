@@ -1,0 +1,33 @@
+build/.buildvenv/
+.venv/
+build/build/
+build/dist/
+build/.playwright-cache/
+build/.ffmpeg-cache/
+build/.deno-cache/
+build/.yt-dlp-cache/
+build/_app_version.txt
+__pycache__/
+*.pyc
+
+# Local Claude Code settings
+.claude/
+
+# Bundled ffmpeg binaries (large)
+ffmpeg/
+
+# Cookie files (may contain login sessions)
+cookies.txt*
+**/cookies.txt*
+
+# Local cookie refresher artifacts
+.ytdlp-cookie-refresher/
+cookies-test.txt
+
+# Docker deployment: the Telegram bot token lives in docker/.env, the data in docker/data/
+.env
+docker/.env
+docker/data/
+
+# downloads
+downloads/

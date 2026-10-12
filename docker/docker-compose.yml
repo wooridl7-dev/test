@@ -1,0 +1,73 @@
+# Two-service compose: bgutil sidecar + downloader bot.
+#
+#   docker compose up -d
+#
+# The downloader waits for bgutil, talks to it over the internal
+# `ytdlp` network, and never exposes port 4416 to the host. To poke at
+# the provider from the host during development, use the "dev" variant
+# described in docker/README.md.
+
+services:
+  bgutil:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+    # Port intentionally NOT published; only reachable over the
+    # `ytdlp` network from the downloader container.
+    expose:
+      - "4416"
+    networks:
+      - ytdlp
+    healthcheck:
+      # The image ships node but neither wget nor curl.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4416/ping').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  downloader:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.downloader
+    depends_on:
+      bgutil:
+        condition: service_healthy
+    environment:
+      YTDLP_AUTH_METHOD: bgutil
+      YTDLP_GETPOT_BGUTIL_BASEURL: http://bgutil:4416
+      YTDLP_OUTPUT_DIR: /data/downloads
+      PYTHONUNBUFFERED: "1"
+      # The bot refuses to start without these two. Put them in docker/.env
+      # (compose reads it) or export them; never commit the token.
+      YTDLP_BOT_TOKEN: "${YTDLP_BOT_TOKEN:?set YTDLP_BOT_TOKEN (token from @BotFather)}"
+      YTDLP_BOT_ALLOWED_CHATS: "${YTDLP_BOT_ALLOWED_CHATS:?set YTDLP_BOT_ALLOWED_CHATS (comma-separated chat ids)}"
+      # Optional tuning. docker/.env only feeds the ${...} substitutions in THIS file, so a
+      # variable reaches the bot only if it is listed here. Empty means "the bot's default"
+      # (the bot treats an empty value as unset). Set them in docker/.env or the shell.
+      YTDLP_BOT_MAX_PARALLEL: "${YTDLP_BOT_MAX_PARALLEL:-}"
+      YTDLP_BOT_MAX_QUEUED: "${YTDLP_BOT_MAX_QUEUED:-}"
+      YTDLP_BOT_ALLOWED_HOSTS: "${YTDLP_BOT_ALLOWED_HOSTS:-}"
+      YTDLP_AUDIO_LANG: "${YTDLP_AUDIO_LANG:-}"
+      YTDLP_FRAGMENT_RETRIES: "${YTDLP_FRAGMENT_RETRIES:-}"
+      YTDLP_STALL_MINUTES: "${YTDLP_STALL_MINUTES:-}"
+    volumes:
+      - ./data/downloads:/data/downloads
+      - ./data/cookies.txt:/app/cookies.txt:ro
+      # The per-download run logs (everything yt-dlp printed and how each run ended). Without
+      # this they live in the container and vanish when it is recreated (`up --build`, `down`).
+      - ./data/logs:/root/.ytdlp-downloader/logs
+    networks:
+      - ytdlp
+    # The bot is a long-running service: a crash or a network blip at start
+    # should bring it back. Exit code 2 means a configuration it cannot fix
+    # (wrong token, empty allow-list), so retry a few times, not forever.
+    # A clean stop (`docker compose stop`) is never restarted.
+    restart: "on-failure:5"
+
+networks:
+  ytdlp:
+    driver: bridge

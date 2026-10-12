@@ -1,0 +1,24 @@
+# Build context is the repo root (docker-compose.yml: context: ..).
+# Keep it to the Python sources the headless bot needs.
+
+# Windows build caches / outputs and bundled binaries (several GB)
+build/
+ffmpeg/
+
+# Login sessions must never be baked into an image; compose mounts
+# docker/data/cookies.txt read-only at runtime instead.
+cookies.txt*
+**/cookies.txt*
+cookies-test.txt
+.ytdlp-cookie-refresher/
+
+# Runtime data mounted as volumes
+docker/data/
+
+# VCS, local tooling, caches
+.git/
+.claude/
+.venv/
+**/__pycache__/
+**/*.pyc
+tests/

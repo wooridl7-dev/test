@@ -1,0 +1,77 @@
+========================================
+  yt-dlp 다운로더 빠른 시작 가이드
+========================================
+
+【방식 A. 배포본 사용 (권장, Python 불필요)】
+------------------------------------------
+
+1. yt-dlp-downloader-<version>-win-x64.zip 압축 해제
+
+2. yt-dlp-gui.exe 더블클릭 (또는 CMD/탐색기에서 실행)
+
+3. GUI에서:
+   - "쿠키 자동 갱신" 버튼 클릭 → Chromium 창에서 YouTube 로그인 → 창 닫기
+   - URL 입력
+   - "다운로드 시작" 버튼 클릭
+
+yt-dlp / deno / Playwright + Chromium 이 모두 번들에 포함되어 있어
+conda/pip/venv 설정 없이 바로 동작합니다.
+
+
+【방식 B. 소스에서 실행 (개발자용)】
+------------------------------
+
+본 프로젝트는 uv 로 의존성을 관리합니다 (.python-version: 3.12).
+
+1. uv 설치 (한 번만)
+   irm https://astral.sh/uv/install.ps1 | iex
+
+2. Python 3.12 인터프리터를 빌려 격리된 .venv 생성
+   (작성자 환경 예시 — 본인의 Python 3.12 경로로 교체)
+   uv venv --python C:\tools\miniconda3\envs\ryzen-ai-1.6.1\python.exe
+
+3. 활성화 + yt-dlp 설치
+   .venv\Scripts\Activate.ps1
+   uv pip install yt-dlp
+
+4. 프로그램 실행
+   python main.py          (GUI)
+   python main.py --cli    (CLI)
+
+※ 작성자는 ryzen-ai-1.6.1 conda env(NPU 툴체인용 개인 환경)의 Python
+   3.12.11 을 --python 으로 빌려 사용합니다. conda env 자체는 변경되지
+   않으며, 다른 Python 3.12 (다른 conda env / pyenv / system Python)
+   모두 사용 가능합니다.
+
+
+【배포본 빌드하기 (개발자용)】
+------------------------------
+
+cd build
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Clean
+
+산출물: build\dist\yt-dlp-downloader-<version>-win-x64.zip
+
+
+【문제 해결】
+------------
+
+X "다운로드 실패" 에러
+   → "쿠키 자동 갱신" 으로 세션 재발급 후 재시도
+
+X "봇 감지" 에러
+   → "쿠키 자동 갱신" 클릭 → YouTube 로그인
+   → 또는 다른 브라우저에서 확장으로 cookies.txt 수동 export
+
+X "No module named 'yt_dlp'" (소스 모드만)
+   → uv pip install yt-dlp  (방식 B 의 .venv 활성화 상태에서)
+   → 배포본(.exe) 에서는 이 오류가 뜨지 않음
+
+
+【진단 실행 (소스 모드)】
+------------------------
+
+python diagnose.py
+
+
+========================================
